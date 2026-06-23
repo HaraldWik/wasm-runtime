@@ -1,0 +1,12 @@
+.{
+    .name = .wasm,
+    .version = "0.0.0",
+    .fingerprint = 0xa9a8d1fe4ad98c9c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
