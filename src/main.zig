@@ -83,4 +83,9 @@ pub fn main(init: std.process.Init) !void {
     for (parser.tags, 0..) |tag, i| {
         std.debug.print("\t{d}: attribute: {d}, type_index: {d}\n", .{ i, tag.attribute, tag.type_index });
     }
+
+    std.debug.print("\nEXECUTION\n", .{});
+
+    var interpreter: wasm.Interpreter = .{};
+    try interpreter.call(parser.code.functions[0]);
 }
