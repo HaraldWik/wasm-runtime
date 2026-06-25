@@ -86,6 +86,11 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\nEXECUTION\n", .{});
 
-    var interpreter: wasm.Interpreter = .{};
-    try interpreter.call(parser.code.functions[0]);
+    var interpreter: wasm.Interpreter = .init(gpa);
+    defer interpreter.deinit();
+
+    var params: [2]wasm.Interpreter.Value = undefined;
+    params[0] = .{ .i32 = 2 };
+    params[1] = .{ .i32 = 9 };
+    try interpreter.call(parser.code.functions[0], params[0..]);
 }
