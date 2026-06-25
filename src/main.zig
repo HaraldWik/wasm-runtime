@@ -23,74 +23,74 @@ pub fn main(init: std.process.Init) !void {
 
     var reader: std.Io.Reader = .fixed(bytes);
 
-    var parser: wasm.bin.Parser = .init(gpa);
-    defer parser.deinit();
-    try parser.parse(&reader);
+    var module: wasm.Module = .init(gpa);
+    defer module.deinit();
+    try module.parse(&reader);
 
     std.debug.print("types:\n", .{});
-    for (parser.types, 0..) |t, i| {
+    for (module.types, 0..) |t, i| {
         std.debug.print("\t{d}: {any}\n", .{ i, t });
     }
 
     std.debug.print("imports:\n", .{});
-    for (parser.imports, 0..) |import, i| {
+    for (module.imports, 0..) |import, i| {
         std.debug.print("\t{d}: {s}.{s} {t} {?}\n", .{ i, import.module_name, import.field_name, import.kind, import.type_index });
     }
 
     std.debug.print("functions:\n", .{});
-    for (parser.functions, 0..) |f, i| {
+    for (module.functions, 0..) |f, i| {
         std.debug.print("\t{d}: {d}\n", .{ i, f });
     }
 
     std.debug.print("tables:\n", .{});
-    for (parser.tables, 0..) |table, i| {
+    for (module.tables, 0..) |table, i| {
         std.debug.print("\t{d}: {any}\n", .{ i, table });
     }
 
     std.debug.print("memories:\n", .{});
-    for (parser.memories, 0..) |memory, i| {
+    for (module.memories, 0..) |memory, i| {
         std.debug.print("\t{d}: {any}\n", .{ i, memory });
     }
 
     std.debug.print("globals:\n", .{});
-    for (parser.globals, 0..) |globals, i| {
+    for (module.globals, 0..) |globals, i| {
         std.debug.print("\t{d}: {any}\n", .{ i, globals });
     }
 
     std.debug.print("exports:\n", .{});
-    for (parser.exports, 0..) |exp, i| {
+    for (module.exports.values(), 0..) |exp, i| {
         std.debug.print("\t{d}: {d} {s} {t}\n", .{ i, exp.index, exp.name, exp.kind });
     }
 
-    std.debug.print("start: {d}\n", .{parser.start});
+    std.debug.print("start: {d}\n", .{module.start});
 
     std.debug.print("elements:\n", .{});
-    for (parser.elements, 0..) |element, i| {
+    for (module.elements, 0..) |element, i| {
         std.debug.print("\t{d}: {any}\n", .{ i, element });
     }
 
     std.debug.print("code:\n", .{});
-    for (parser.code.functions, 0..) |function, i| {
+    for (module.code.functions, 0..) |function, i| {
         std.debug.print("\t{d}: {d} {any}\n", .{ i, function.locals.len, function.locals });
     }
 
     std.debug.print("data:\n", .{});
-    for (parser.data, 0..) |segment, i| {
+    for (module.data, 0..) |segment, i| {
         std.debug.print("\t{d}: index: {d}, offset: {d}, len: {d}\n", .{ i, segment.memory_index, segment.offset, segment.bytes.len });
     }
 
     std.debug.print("tags:\n", .{});
-    for (parser.tags, 0..) |tag, i| {
+    for (module.tags, 0..) |tag, i| {
         std.debug.print("\t{d}: attribute: {d}, type_index: {d}\n", .{ i, tag.attribute, tag.type_index });
     }
 
     std.debug.print("\nEXECUTION\n", .{});
 
-    var interpreter: wasm.Interpreter = .init(gpa);
+    var interpreter: wasm.Interpreter = .init(gpa, &module);
     defer interpreter.deinit();
 
     var params: [2]wasm.Interpreter.Value = undefined;
     params[0] = .{ .i32 = 2 };
     params[1] = .{ .i32 = 9 };
-    try interpreter.call(parser.code.functions[0], params[0..]);
+    try interpreter.call("addTwo", &.{});
 }

@@ -62,3 +62,20 @@ pub fn readI64(r: *std.Io.Reader) std.Io.Reader.Error!i64 {
 
     return result;
 }
+
+pub fn readIntoAny(comptime T: type, r: *std.Io.Reader) std.Io.Reader.Error!T {
+    var t: T = undefined;
+    switch (@typeInfo(T)) {
+        .void => t = {},
+        .int => |int| t = switch (int.signedness) {
+            .signed => try if (int.bits == 32) readI32(r) else readI64(r),
+            .unsigned => try readU32(r),
+        },
+        .@"struct" => |s| inline for (s.fields) |field| {
+            const field_val = try readIntoAny(field.type, r);
+            @field(t, field.name) = field_val;
+        },
+        else => @compileError("invalid type found"),
+    }
+    return t;
+}

@@ -13,7 +13,6 @@ pub fn build(b: *std.Build) void {
             .pic = true,
         }),
     });
-    exe.entry = .disabled;
     exe.rdynamic = false;
 
     b.installArtifact(exe);
