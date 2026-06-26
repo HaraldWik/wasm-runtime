@@ -6,6 +6,8 @@ pub const Module = @import("Module.zig");
 pub const Interpreter = struct {
     gpa: std.mem.Allocator,
     module: *const Module,
+    memory: []u8 = &.{},
+    globals: []Global = &.{},
     frames: std.ArrayList(Frame) = .empty,
 
     pub const Value = union(enum) {
@@ -13,6 +15,36 @@ pub const Interpreter = struct {
         i64: i64,
         f32: f32,
         f64: f64,
+
+        pub fn fromValueType(value_type: Module.ValueType) Value {
+            return switch (value_type) {
+                .v128, .funcref, .externref => unreachable,
+                inline else => |vt| @unionInit(Value, @tagName(vt), 0),
+            };
+        }
+    };
+
+    pub const Global = struct {
+        value: Value,
+        mutability: Module.Global.Mutability,
+
+        pub fn init(module: *const Module, index: usize) Global {
+            const global = module.globals[index];
+
+            var value: Value = .fromValueType(global.value_type);
+
+            switch (global.init_expr) {
+                .i32_const => |v| value.i32 = v,
+                .i64_const => |v| value.i64 = v,
+                .f32_const => |v| value.f32 = v,
+                .f64_const => |v| value.f64 = v,
+                .global_get => |i| value = Global.init(module, i).value,
+            }
+            return .{
+                .value = value,
+                .mutability = global.mutability,
+            };
+        }
     };
 
     pub const Opcode = enum(u8) {
@@ -106,6 +138,7 @@ pub const Interpreter = struct {
         i64_le_s = 0x57,
         i64_le_u = 0x58,
         i64_ge_s = 0x59,
+        i64_ge_u = 0x5A,
 
         // i32 arithmetic
         i32_clz = 0x67,
@@ -324,6 +357,7 @@ pub const Interpreter = struct {
         i64_le_s,
         i64_le_u,
         i64_ge_s,
+        i64_ge_u,
 
         // i32 arithmetic
         i32_clz,
@@ -437,29 +471,6 @@ pub const Interpreter = struct {
         };
 
         pub fn create(r: *std.Io.Reader, opcode: Opcode) Operation {
-            // return switch (opcode) {
-            //     .call => .{ .call = leb.readU32(r) catch unreachable },
-            //     .call_indirect => .{ .call_indirect = leb.readU32(r) catch unreachable },
-
-            //     .br => .{ .br = leb.readU32(r) catch unreachable },
-            //     .br_if => .{ .br_if = leb.readU32(r) catch unreachable },
-
-            //     .local_get => .{ .local_get = leb.readU32(r) catch unreachable },
-            //     .local_set => .{ .local_set = leb.readU32(r) catch unreachable },
-            //     .local_tee => .{ .local_tee = leb.readU32(r) catch unreachable },
-
-            //     .global_get => .{ .global_get = leb.readU32(r) catch unreachable },
-            //     .global_set => .{ .global_set = leb.readU32(r) catch unreachable },
-
-            //     .i32_const => .{ .i32_const = leb.readI32(r) catch unreachable },
-            //     .i64_const => .{ .i64_const = leb.readI64(r) catch unreachable },
-
-            //     .f32_const => .{ .f32_const = r.takeInt(u32, .little) catch unreachable },
-            //     .f64_const => .{ .f64_const = r.takeInt(u64, .little) catch unreachable },
-
-            //     inline else => |op| @unionInit(Operation, @tagName(op), {}),
-            // };
-
             switch (opcode) {
                 .br_table => {
                     const targets_len = leb.readU32(r) catch unreachable;
@@ -485,6 +496,15 @@ pub const Interpreter = struct {
         gpa: std.mem.Allocator,
         array_list: std.ArrayList(Value) = .empty,
 
+        pub fn deinit(self: *Stack) void {
+            self.array_list.deinit(self.gpa);
+        }
+
+        pub fn merge(self: *Stack, stack: *Stack) std.mem.Allocator.Error!void {
+            try self.array_list.appendSlice(self.gpa, stack.array_list.items);
+            stack.deinit();
+        }
+
         pub fn push(self: *Stack, value: Value) std.mem.Allocator.Error!void {
             try self.array_list.append(self.gpa, value);
         }
@@ -497,11 +517,12 @@ pub const Interpreter = struct {
             return self.array_list.pop();
         }
 
-        pub fn popTwo(self: *Stack) struct { Value, Value } {
-            return .{
-                self.array_list.pop().?,
-                self.array_list.pop().?,
-            };
+        pub fn getLast(self: Stack) Value {
+            return self.array_list.getLast();
+        }
+
+        pub fn getLastOrNull(self: Stack) ?Value {
+            return self.array_list.getLastOrNull();
         }
     };
 
@@ -517,32 +538,58 @@ pub const Interpreter = struct {
         }
     };
 
-    pub fn init(gpa: std.mem.Allocator, module: *const Module) Interpreter {
-        return .{ .gpa = gpa, .module = module };
+    pub fn init(gpa: std.mem.Allocator, module: *const Module) !Interpreter {
+        const globals = try gpa.alloc(Global, module.globals.len);
+        for (globals, 0..) |*global, i| global.* = .init(module, i);
+
+        return .{
+            .gpa = gpa,
+            .module = module,
+            .memory = try gpa.alloc(u8, 1024),
+            .globals = globals,
+        };
     }
 
     pub fn deinit(self: *Interpreter) void {
         self.frames.deinit(self.gpa);
+        self.gpa.free(self.memory);
+        self.gpa.free(self.globals);
     }
 
-    pub fn call(self: *Interpreter, export_symbol: []const u8, params: []Value) !void {
-        var frame: Frame = .init(self.gpa, params);
-        try self.frames.append(self.gpa, frame);
-        defer {
-            frame.stack.array_list.deinit(frame.stack.gpa);
-            _ = self.frames.pop();
-        }
+    pub const CallError = std.Io.Reader.TakeEnumError || std.mem.Allocator.Error;
 
+    pub fn call(self: *Interpreter, export_symbol: []const u8, params: []Value) CallError!void {
         const exp = self.module.exports.get(export_symbol).?;
         std.debug.assert(exp.kind == .function);
 
-        const body = self.module.code.functions[exp.index];
+        var stack = try self.callIndex(exp.index, params);
+        defer stack.deinit();
+    }
+
+    fn callIndex(self: *Interpreter, index: usize, params: []Value) CallError!Stack {
+        const gpa = self.gpa;
+
+        std.log.info("call index: {d}, params: {any}", .{ index - self.module.imports.len, params });
+        const body = self.module.code.functions[index - self.module.imports.len];
+
+        const locals = try gpa.alloc(Value, params.len + body.locals.len);
+        defer gpa.free(locals);
+        @memcpy(locals[0..params.len], params);
+        for (locals[params.len..], body.locals) |*local, value_type| {
+            local.* = .fromValueType(value_type);
+        }
+
+        var frame: Frame = .init(gpa, locals);
+        try self.frames.append(gpa, frame);
+        defer _ = self.frames.pop();
 
         var code: std.Io.Reader = .fixed(body.code);
         try self.execute(&frame, &code);
+
+        return frame.stack;
     }
 
-    pub fn execute(self: Interpreter, frame: *Frame, code: *std.Io.Reader) !void {
+    pub fn execute(self: *Interpreter, frame: *Frame, code: *std.Io.Reader) CallError!void {
         while (true) {
             const opcode = try code.takeEnumNonexhaustive(Opcode, .little);
             if (opcode == .end) break;
@@ -557,8 +604,7 @@ pub const Interpreter = struct {
         }
     }
 
-    pub fn operate(self: Interpreter, op: Operation, frame: *Frame) !void {
-        _ = self;
+    pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void {
         switch (op) {
             .@"unreachable" => unreachable,
             .nop => _ = frame.stack.pop(),
@@ -575,7 +621,10 @@ pub const Interpreter = struct {
             .br_table => {},
 
             .@"return" => {},
-            .call => {},
+            .call => |i| {
+                var return_stack = try self.callIndex(i, frame.stack.array_list.items);
+                try frame.stack.merge(&return_stack);
+            },
 
             .call_indirect => {},
 
@@ -584,18 +633,51 @@ pub const Interpreter = struct {
             .select => {},
 
             // Variable access
-            .local_get => {},
-            .local_set => {},
-            .local_tee => {},
+            .local_get => |i| try frame.stack.push(frame.locals[i]),
+            .local_set => |i| frame.locals[i] = frame.stack.pop(),
+            .local_tee => |i| frame.locals[i] = frame.stack.getLast(),
 
-            .global_get => {},
-            .global_set => {},
+            .global_get => |i| try frame.stack.push(self.globals[i].value),
+            .global_set => |i| {
+                std.debug.assert(self.globals[i].mutability == .@"var");
+                self.globals[i].value = frame.stack.pop();
+            },
 
             // Memory (all use memarg: align + offset)
-            .i32_load => {},
-            .i64_load => {},
-            .f32_load => {},
-            .f64_load => {},
+            .i32_load => |mem_arg| {
+                const address: u32 = @intCast(frame.stack.pop().i32);
+                const ea = @as(usize, @intCast(address + mem_arg.offset));
+
+                const bytes = self.memory[ea .. ea + 4][0..4];
+                const value = std.mem.readInt(i32, bytes, .little);
+
+                try frame.stack.push(.{ .i32 = value });
+            },
+            .i64_load => |mem_arg| {
+                const address: u64 = @intCast(frame.stack.pop().i64);
+                const ea = @as(usize, @intCast(address + mem_arg.offset));
+
+                const bytes = self.memory[ea .. ea + 8][0..8];
+                const value = std.mem.readInt(i64, bytes, .little);
+
+                try frame.stack.push(.{ .i64 = value });
+            },
+            .f32_load => |mem_arg| {
+                const address: u32 = @intCast(frame.stack.pop().i32);
+                const ea = @as(usize, @intCast(address + mem_arg.offset));
+
+                const value = std.mem.readInt(u32, self.memory[ea .. ea + 4][0..4], .little);
+
+                try frame.stack.push(.{ .f32 = @bitCast(value) });
+            },
+            .f64_load => |mem_arg| {
+                const address: u64 = @intCast(frame.stack.pop().i32);
+                const ea = @as(usize, @intCast(address + mem_arg.offset));
+
+                const value = std.mem.readInt(u64, self.memory[ea .. ea + 8][0..8], .little);
+
+                try frame.stack.push(.{ .f64 = @bitCast(value) });
+            },
 
             .i32_load8_s => {},
             .i32_load8_u => {},
@@ -629,96 +711,219 @@ pub const Interpreter = struct {
             .f64_const => |v| try frame.stack.push(.{ .f64 = @bitCast(v) }),
 
             // i32 comparisons
-            .i32_eqz => {},
-            .i32_eq => {},
-            .i32_ne => {},
-            .i32_lt_s => {},
-            .i32_lt_u => {},
-            .i32_gt_s => {},
-            .i32_gt_u => {},
-            .i32_le_s => {},
-            .i32_le_u => {},
-            .i32_ge_s => {},
-            .i32_ge_u => {},
+            .i32_eqz => try frame.stack.push(.{ .i32 = @intFromBool(frame.stack.pop().i32 == 0) }),
+            .i32_eq,
+            .i32_ne,
+            .i32_lt_s,
+            .i32_gt_s,
+            .i32_le_s,
+            .i32_ge_s,
+            .i32_lt_u,
+            .i32_gt_u,
+            .i32_le_u,
+            .i32_ge_u,
+            => {
+                const rhs = frame.stack.pop().i32;
+                const lhs = frame.stack.pop().i32;
+                const result = switch (op) {
+                    .i32_eq => lhs == rhs,
+                    .i32_ne => lhs != rhs,
+                    .i32_lt_s => lhs < rhs,
+                    .i32_gt_s => lhs > rhs,
+                    .i32_le_s => lhs <= rhs,
+                    .i32_ge_s => lhs >= rhs,
+                    .i32_lt_u => @as(u32, @bitCast(lhs)) < @as(u32, @bitCast(rhs)),
+                    .i32_gt_u => @as(u32, @bitCast(lhs)) > @as(u32, @bitCast(rhs)),
+                    .i32_le_u => @as(u32, @bitCast(lhs)) <= @as(u32, @bitCast(rhs)),
+                    .i32_ge_u => @as(u32, @bitCast(lhs)) >= @as(u32, @bitCast(rhs)),
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .i32 = @intFromBool(result) });
+            },
 
             // i64 comparisons
-            .i64_eqz => {},
-            .i64_eq => {},
-            .i64_ne => {},
-            .i64_lt_s => {},
-            .i64_lt_u => {},
-            .i64_gt_s => {},
-            .i64_gt_u => {},
-            .i64_le_s => {},
-            .i64_le_u => {},
-            .i64_ge_s => {},
+            .i64_eqz => try frame.stack.push(.{ .i64 = @intFromBool(frame.stack.pop().i64 == 0) }),
+            .i64_eq,
+            .i64_ne,
+            .i64_lt_s,
+            .i64_lt_u,
+            .i64_gt_s,
+            .i64_gt_u,
+            .i64_le_s,
+            .i64_le_u,
+            .i64_ge_s,
+            .i64_ge_u,
+            => {
+                const rhs = frame.stack.pop().i64;
+                const lhs = frame.stack.pop().i64;
+                const result = switch (op) {
+                    .i64_eq => lhs == rhs,
+                    .i64_ne => lhs != rhs,
+                    .i64_lt_s => lhs < rhs,
+                    .i64_gt_s => lhs > rhs,
+                    .i64_le_s => lhs <= rhs,
+                    .i64_ge_s => lhs >= rhs,
+                    .i64_lt_u => @as(u64, @bitCast(lhs)) < @as(u64, @bitCast(rhs)),
+                    .i64_gt_u => @as(u64, @bitCast(lhs)) > @as(u64, @bitCast(rhs)),
+                    .i64_le_u => @as(u64, @bitCast(lhs)) <= @as(u64, @bitCast(rhs)),
+                    .i64_ge_u => @as(u64, @bitCast(lhs)) >= @as(u64, @bitCast(rhs)),
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .i64 = @intFromBool(result) });
+            },
 
             // i32 arithmetic
-            .i32_clz => {},
-            .i32_ctz => {},
-            .i32_popcnt => {},
+            .i32_clz => try frame.stack.push(.{ .i32 = @clz(frame.stack.pop().i32) }),
+            .i32_ctz => try frame.stack.push(.{ .i32 = @ctz(frame.stack.pop().i32) }),
+            .i32_popcnt => try frame.stack.push(.{ .i32 = @popCount(frame.stack.pop().i32) }),
 
-            .i32_add => {},
-            .i32_sub => {},
-            .i32_mul => {},
-            .i32_div_s => {},
-            .i32_div_u => {},
-            .i32_rem_s => {},
-            .i32_rem_u => {},
-
-            .i32_and => {},
-            .i32_or => {},
-            .i32_xor => {},
-            .i32_shl => {},
-            .i32_shr_s => {},
-            .i32_shr_u => {},
-            .i32_rotl => {},
-            .i32_rotr => {},
+            .i32_add,
+            .i32_sub,
+            .i32_mul,
+            .i32_div_s,
+            .i32_div_u,
+            .i32_rem_s,
+            .i32_rem_u,
+            .i32_and,
+            .i32_or,
+            .i32_xor,
+            .i32_shl,
+            .i32_shr_s,
+            .i32_shr_u,
+            .i32_rotl,
+            .i32_rotr,
+            => {
+                const rhs = frame.stack.pop().i32;
+                const lhs = frame.stack.pop().i32;
+                const result: i32 = switch (op) {
+                    .i32_add => lhs + rhs,
+                    .i32_sub => lhs - rhs,
+                    .i32_mul => lhs * rhs,
+                    .i32_div_s => @divTrunc(lhs, rhs),
+                    .i32_div_u => @intCast(@divTrunc(@as(u32, @bitCast(lhs)), @as(u32, @bitCast(rhs)))),
+                    .i32_rem_s => @rem(lhs, rhs),
+                    .i32_rem_u => @intCast(@rem(@as(u32, @bitCast(lhs)), @as(u32, @bitCast(rhs)))),
+                    .i32_and => lhs & rhs,
+                    .i32_or => lhs | rhs,
+                    .i32_xor => lhs ^ rhs,
+                    .i32_shl => lhs << @intCast(rhs & 31),
+                    .i32_shr_s => @as(i32, lhs) >> @intCast(rhs & 31),
+                    .i32_shr_u => @intCast(@as(u32, @bitCast(lhs)) >> @as(u5, @intCast(rhs & 31))),
+                    .i32_rotl => @intCast(std.math.rotl(u32, @as(u32, @bitCast(lhs)), @as(u32, @intCast(rhs & 31)))),
+                    .i32_rotr => @intCast(std.math.rotr(u32, @as(u32, @bitCast(lhs)), @as(u32, @intCast(rhs & 31)))),
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .i32 = result });
+            },
 
             // i64 arithmetic
-            .i64_clz => {},
-            .i64_ctz => {},
-            .i64_popcnt => {},
+            .i64_clz => try frame.stack.push(.{ .i64 = @clz(frame.stack.pop().i64) }),
+            .i64_ctz => try frame.stack.push(.{ .i64 = @ctz(frame.stack.pop().i64) }),
+            .i64_popcnt => try frame.stack.push(.{ .i64 = @popCount(frame.stack.pop().i64) }),
 
-            .i64_add => {},
-            .i64_sub => {},
-            .i64_mul => {},
-            .i64_div_s => {},
-            .i64_div_u => {},
-            .i64_rem_s => {},
-            .i64_rem_u => {},
-
-            .i64_and => {},
-            .i64_or => {},
-            .i64_xor => {},
-            .i64_shl => {},
-            .i64_shr_s => {},
-            .i64_shr_u => {},
-            .i64_rotl => {},
-            .i64_rotr => {},
+            .i64_add,
+            .i64_sub,
+            .i64_mul,
+            .i64_div_s,
+            .i64_div_u,
+            .i64_rem_s,
+            .i64_rem_u,
+            .i64_and,
+            .i64_or,
+            .i64_xor,
+            .i64_shl,
+            .i64_shr_s,
+            .i64_shr_u,
+            .i64_rotl,
+            .i64_rotr,
+            => {
+                const rhs = frame.stack.pop().i64;
+                const lhs = frame.stack.pop().i64;
+                const result: i64 = switch (op) {
+                    .i64_add => lhs + rhs,
+                    .i64_sub => lhs - rhs,
+                    .i64_mul => lhs * rhs,
+                    .i64_div_s => @divTrunc(lhs, rhs),
+                    .i64_div_u => @intCast(@divTrunc(@as(u64, @bitCast(lhs)), @as(u64, @bitCast(rhs)))),
+                    .i64_rem_s => @rem(lhs, rhs),
+                    .i64_rem_u => @intCast(@rem(@as(u64, @bitCast(lhs)), @as(u64, @bitCast(rhs)))),
+                    .i64_and => lhs & rhs,
+                    .i64_or => lhs | rhs,
+                    .i64_xor => lhs ^ rhs,
+                    .i64_shl => lhs << @intCast(rhs & 31),
+                    .i64_shr_s => @as(i64, lhs) >> @intCast(rhs & 31),
+                    .i64_shr_u => @intCast(@as(u64, @bitCast(lhs)) >> @as(u5, @intCast(rhs & 31))),
+                    .i64_rotl => @intCast(std.math.rotl(u64, @as(u64, @bitCast(lhs)), @as(u64, @intCast(rhs & 31)))),
+                    .i64_rotr => @intCast(std.math.rotr(u64, @as(u64, @bitCast(lhs)), @as(u64, @intCast(rhs & 31)))),
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .i64 = result });
+            },
 
             // f32 arithmetic
-            .f32_abs => {},
-            .f32_neg => {},
-            .f32_ceil => {},
-            .f32_floor => {},
-            .f32_trunc => {},
-            .f32_nearest => {},
-            .f32_sqrt => {},
+            .f32_abs,
+            .f32_neg,
+            .f32_ceil,
+            .f32_floor,
+            .f32_trunc,
+            .f32_nearest,
+            .f32_sqrt,
+            => {
+                const v = frame.stack.pop().f32;
+                const result = switch (op) {
+                    .f32_abs => @abs(v),
+                    .f32_neg => -v,
+                    .f32_ceil => @ceil(v),
+                    .f32_floor => @floor(v),
+                    .f32_trunc => @trunc(v),
+                    .f32_nearest => @round(v),
+                    .f32_sqrt => @sqrt(v),
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .f32 = result });
+            },
 
-            .f32_add => {},
-            .f32_sub => {},
-            .f32_mul => {},
-            .f32_div => {},
-            .f32_min => {},
-            .f32_max => {},
+            .f32_add,
+            .f32_sub,
+            .f32_mul,
+            .f32_div,
+            .f32_min,
+            .f32_max,
+            => {
+                const rhs = frame.stack.pop().f32;
+                const lhs = frame.stack.pop().f32;
+                const result = switch (op) {
+                    .f32_add => lhs + rhs,
+                    .f32_sub => lhs - rhs,
+                    .f32_mul => lhs * rhs,
+                    .f32_div => lhs / rhs,
+                    .f32_min => @min(lhs, rhs),
+                    .f32_max => @max(lhs, rhs),
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .f32 = result });
+            },
 
-            .f32_eq => {},
-            .f32_ne => {},
-            .f32_lt => {},
-            .f32_gt => {},
-            .f32_le => {},
-            .f32_ge => {},
+            .f32_eq,
+            .f32_ne,
+            .f32_lt,
+            .f32_gt,
+            .f32_le,
+            .f32_ge,
+            => {
+                const rhs = frame.stack.pop().f32;
+                const lhs = frame.stack.pop().f32;
+                const result = switch (op) {
+                    .f32_eq => lhs == rhs,
+                    .f32_ne => lhs != rhs,
+                    .f32_lt => lhs < rhs,
+                    .f32_gt => lhs > rhs,
+                    .f32_le => lhs <= rhs,
+                    .f32_ge => lhs >= rhs,
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .i32 = @intFromBool(result) });
+            },
 
             .f32_convert_i32_s => {},
             .f32_convert_i32_u => {},
@@ -726,27 +931,69 @@ pub const Interpreter = struct {
             .f32_convert_i64_u => {},
 
             // f64 arithmetic
-            .f64_abs => {},
-            .f64_neg => {},
-            .f64_ceil => {},
-            .f64_floor => {},
-            .f64_trunc => {},
-            .f64_nearest => {},
-            .f64_sqrt => {},
+            .f64_abs,
+            .f64_neg,
+            .f64_ceil,
+            .f64_floor,
+            .f64_trunc,
+            .f64_nearest,
+            .f64_sqrt,
+            => {
+                const v = frame.stack.pop().f64;
+                const result = switch (op) {
+                    .f64_abs => @abs(v),
+                    .f64_neg => -v,
+                    .f64_ceil => @ceil(v),
+                    .f64_floor => @floor(v),
+                    .f64_trunc => @trunc(v),
+                    .f64_nearest => @round(v),
+                    .f64_sqrt => @sqrt(v),
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .f64 = result });
+            },
 
-            .f64_add => {},
-            .f64_sub => {},
-            .f64_mul => {},
-            .f64_div => {},
-            .f64_min => {},
-            .f64_max => {},
+            .f64_add,
+            .f64_sub,
+            .f64_mul,
+            .f64_div,
+            .f64_min,
+            .f64_max,
+            => {
+                const rhs = frame.stack.pop().f64;
+                const lhs = frame.stack.pop().f64;
+                const result = switch (op) {
+                    .f64_add => lhs + rhs,
+                    .f64_sub => lhs - rhs,
+                    .f64_mul => lhs * rhs,
+                    .f64_div => lhs / rhs,
+                    .f64_min => @min(lhs, rhs),
+                    .f64_max => @max(lhs, rhs),
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .f64 = result });
+            },
 
-            .f64_eq => {},
-            .f64_ne => {},
-            .f64_lt => {},
-            .f64_gt => {},
-            .f64_le => {},
-            .f64_ge => {},
+            .f64_eq,
+            .f64_ne,
+            .f64_lt,
+            .f64_gt,
+            .f64_le,
+            .f64_ge,
+            => {
+                const rhs = frame.stack.pop().f64;
+                const lhs = frame.stack.pop().f64;
+                const result = switch (op) {
+                    .f64_eq => lhs == rhs,
+                    .f64_ne => lhs != rhs,
+                    .f64_lt => lhs < rhs,
+                    .f64_gt => lhs > rhs,
+                    .f64_le => lhs <= rhs,
+                    .f64_ge => lhs >= rhs,
+                    else => unreachable,
+                };
+                try frame.stack.push(.{ .i32 = @intFromBool(result) });
+            },
 
             .f64_convert_i32_s => {},
             .f64_convert_i32_u => {},
@@ -754,81 +1001,22 @@ pub const Interpreter = struct {
             .f64_convert_i64_u => {},
 
             // reinterpret conversions
-            .i32_reinterpret_f32 => {},
-            .i64_reinterpret_f64 => {},
-            .f32_reinterpret_i32 => {},
-            .f64_reinterpret_i64 => {},
+            .i32_reinterpret_f32 => {
+                const v = frame.stack.pop().f32;
+                try frame.stack.push(.{ .i32 = @bitCast(v) });
+            },
+            .f32_reinterpret_i32 => {
+                const v = frame.stack.pop().i32;
+                try frame.stack.push(.{ .f32 = @bitCast(v) });
+            },
+            .i64_reinterpret_f64 => {
+                const v = frame.stack.pop().f64;
+                try frame.stack.push(.{ .i64 = @bitCast(v) });
+            },
+            .f64_reinterpret_i64 => {
+                const v = frame.stack.pop().i64;
+                try frame.stack.push(.{ .f64 = @bitCast(v) });
+            },
         }
     }
-
-    // pub fn operateOld(self: Interpreter, op: Operation, frame: *Frame) !void {
-    //     _ = self;
-    //     switch (op) {
-    //         .@"unreachable" => unreachable,
-    //         .nop => _ = frame.stack.pop(),
-
-    //         // locals
-    //         .local_get,
-    //         => |i| try frame.stack.push(frame.locals[i]),
-
-    //         .local_set => |i| {
-    //             const v = frame.stack.pop();
-    //             frame.locals[i] = v;
-    //         },
-
-    //         .local_tee => |i| {
-    //             const v = frame.stack.pop();
-    //             frame.locals[i] = v;
-    //             try frame.stack.push(v);
-    //         },
-
-    //         // constants
-    //         .i32_const => |v| try frame.stack.push(.{ .i32 = v }),
-    //         .i64_const => |v| try frame.stack.push(.{ .i64 = v }),
-
-    //         // arithmetic group (pattern example)
-    //         .i32_add,
-    //         .i32_sub,
-    //         .i32_mul,
-    //         .i32_div_s,
-    //         .i32_div_u,
-    //         .i32_rem_s,
-    //         .i32_rem_u,
-    //         .i32_and,
-    //         .i32_or,
-    //         .i32_xor,
-    //         .i32_shl,
-    //         .i32_shr_s,
-    //         .i32_shr_u,
-    //         .i32_rotl,
-    //         .i32_rotr,
-    //         => {
-    //             const rhs = frame.stack.pop().i32;
-    //             const lhs = frame.stack.pop().i32;
-
-    //             const result: i32 = switch (op) {
-    //                 .i32_add => lhs + rhs,
-    //                 .i32_sub => lhs - rhs,
-    //                 .i32_mul => lhs * rhs,
-    //                 .i32_div_s => @divTrunc(lhs, rhs),
-    //                 .i32_div_u => @bitCast(@as(u32, @bitCast(lhs)) / @as(u32, @bitCast(rhs))),
-    //                 .i32_rem_s => @rem(lhs, rhs),
-    //                 .i32_rem_u => @rem(@as(u32, @bitCast(lhs)), @as(u32, @bitCast(rhs))),
-    //                 .i32_and => lhs & rhs,
-    //                 .i32_or => lhs | rhs,
-    //                 .i32_xor => lhs ^ rhs,
-    //                 .i32_shl => lhs << @intCast(rhs & 31),
-    //                 .i32_shr_s => @bitCast(@as(i32, lhs) >> @intCast(rhs & 31)),
-    //                 .i32_shr_u => @bitCast(@as(u32, @bitCast(lhs)) >> @intCast(rhs & 31)),
-    //                 .i32_rotl => std.math.rotl(u32, @bitCast(lhs), rhs),
-    //                 .i32_rotr => std.math.rotr(u32, @bitCast(lhs), rhs),
-    //                 else => unreachable,
-    //             };
-
-    //             try frame.stack.push(.{ .i32 = result });
-    //         },
-
-    //         .else => {},
-    //     }
-    // }
 };

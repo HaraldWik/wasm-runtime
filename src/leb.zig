@@ -65,6 +65,7 @@ pub fn readI64(r: *std.Io.Reader) std.Io.Reader.Error!i64 {
 
 pub fn readIntoAny(comptime T: type, r: *std.Io.Reader) std.Io.Reader.Error!T {
     var t: T = undefined;
+    // std.log.scoped(.read_into_any).info("{any} {any}", .{ T, r.buffered()[0..8] });
     switch (@typeInfo(T)) {
         .void => t = {},
         .int => |int| t = switch (int.signedness) {

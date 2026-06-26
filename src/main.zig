@@ -86,11 +86,13 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\nEXECUTION\n", .{});
 
-    var interpreter: wasm.Interpreter = .init(gpa, &module);
+    var interpreter: wasm.Interpreter = try .init(gpa, &module);
     defer interpreter.deinit();
 
-    var params: [2]wasm.Interpreter.Value = undefined;
-    params[0] = .{ .i32 = 2 };
-    params[1] = .{ .i32 = 9 };
-    try interpreter.call("addTwo", &.{});
+    var params: [3]wasm.Interpreter.Value = undefined;
+    params[0] = .{ .i32 = 1 };
+    params[1] = .{ .i32 = 2 };
+    params[2] = .{ .i32 = 3 };
+    try interpreter.call("calling", &params);
+    // try interpreter.call("math_i32", &params);
 }

@@ -265,8 +265,9 @@ pub const Global = struct {
     pub const InitExpr = union(enum) {
         i32_const: i32,
         i64_const: i64,
+        f32_const: f32,
+        f64_const: f64,
         global_get: u32,
-        raw: []const u8,
     };
 };
 
@@ -288,7 +289,6 @@ fn parseSectionGlobal(self: *Module, r: *std.Io.Reader) !void {
 
                 break :blk .{ .i32_const = value };
             },
-
             0x42 => blk: { // i64.const
                 const value = try leb.readI64(r);
                 const end = try r.takeByte();
@@ -296,7 +296,20 @@ fn parseSectionGlobal(self: *Module, r: *std.Io.Reader) !void {
 
                 break :blk .{ .i64_const = value };
             },
+            0x43 => blk: { // f32.const
+                const bits: f32 = @bitCast(try r.takeInt(u32, .little));
+                const end = try r.takeByte();
+                if (end != 0x0B) return error.InvalidInitExpr;
 
+                break :blk .{ .f32_const = bits };
+            },
+            0x44 => blk: { // f64.const
+                const bits: f64 = @bitCast(try r.takeInt(u64, .little));
+                const end = try r.takeByte();
+                if (end != 0x0B) return error.InvalidInitExpr;
+
+                break :blk .{ .f64_const = bits };
+            },
             0x23 => blk: { // global.get
                 const index = try leb.readU32(r);
                 const end = try r.takeByte();
@@ -304,10 +317,7 @@ fn parseSectionGlobal(self: *Module, r: *std.Io.Reader) !void {
 
                 break :blk .{ .global_get = index };
             },
-
-            else => {
-                return error.UnsupportedInitExpr;
-            },
+            else => return error.UnsupportedInitExpr,
         };
 
         global.* = .{
@@ -383,19 +393,8 @@ fn parseSectionElement(self: *Module, r: *std.Io.Reader) !void {
 }
 
 pub const FunctionBody = struct {
-    locals: []Local,
+    locals: []ValueType,
     code: []u8,
-
-    pub const Local = struct {
-        count: u32,
-        value_type: ValueType,
-    };
-
-    pub fn localCount(self: FunctionBody) usize {
-        var n: usize = 0;
-        for (self.locals) |local| n += local.count;
-        return n;
-    }
 };
 
 pub const Code = struct {
@@ -413,18 +412,20 @@ fn parseSectionCode(self: *Module, r: *std.Io.Reader) !void {
         const body_end = r.seek + body_size;
 
         const local_count = try leb.readU32(r);
-        const locals = try self.gpa.alloc(FunctionBody.Local, local_count);
+        var locals: std.ArrayList(ValueType) = try .initCapacity(self.gpa, local_count);
 
-        for (locals) |*l| {
-            l.count = try leb.readU32(r);
-            l.value_type = try r.takeEnum(ValueType, .little);
+        for (0..local_count) |_| {
+            const value_type_count = try leb.readU32(r);
+            const value_type = try r.takeEnum(ValueType, .little);
+
+            try locals.appendNTimes(self.gpa, value_type, value_type_count);
         }
 
         const code_start = r.seek;
         // const code_len = body_end - code_start;
 
         function.* = .{
-            .locals = locals,
+            .locals = try locals.toOwnedSlice(self.gpa),
             .code = r.buffer[code_start..body_end],
         };
 
