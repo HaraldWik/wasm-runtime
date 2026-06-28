@@ -1,7 +1,10 @@
 const Module = @This();
 
 const std = @import("std");
-const leb = @import("leb.zig");
+const leb128 = @import("leb128.zig");
+
+const Opcode = @import("code.zig").Opcode;
+const Operation = @import("code.zig").Operation;
 
 gpa: std.mem.Allocator,
 
@@ -44,7 +47,10 @@ pub fn deinit(self: *Module) void {
     const gpa = self.gpa;
 
     for (self.elements) |element| gpa.free(element.function_indices);
-    for (self.code.functions) |functions| gpa.free(functions.locals);
+    for (self.code.functions) |functions| {
+        gpa.free(functions.locals);
+        gpa.free(functions.code);
+    }
 
     gpa.free(self.types);
     gpa.free(self.imports);
@@ -57,6 +63,14 @@ pub fn deinit(self: *Module) void {
     gpa.free(self.code.functions);
     gpa.free(self.data);
     gpa.free(self.tags);
+}
+
+pub fn getImport(self: *const Module, kind: ExternalKind, index: usize) Import {
+    var found: usize = 0;
+    for (self.imports) |import| {
+        if (import.kind == kind) found += 1 else continue;
+        if (index == found - 1) return import;
+    }
 }
 
 pub fn parse(self: *Module, r: *std.Io.Reader) !void {
@@ -98,7 +112,7 @@ pub const Section = struct {
 
     pub fn read(r: *std.Io.Reader) std.Io.Reader.TakeEnumError!Section {
         const id = try r.takeEnum(Id, .little);
-        const size: usize = try leb.readU32(r);
+        const size: usize = try leb128.readInt(u32, r);
         return .{
             .id = id,
             .size = size,
@@ -121,7 +135,7 @@ fn parseSection(self: *Module, r: *std.Io.Reader) !void {
         .memory => try self.parseSectionMemory(payload),
         .global => try self.parseSectionGlobal(payload),
         .@"export" => try self.parseSectionExport(payload),
-        .start => self.start = try leb.readU32(payload),
+        .start => self.start = try leb128.readInt(u32, payload),
         .element => try self.parseSectionElement(payload),
         .code => try self.parseSectionCode(payload),
         .data => try self.parseSectionData(payload),
@@ -139,7 +153,7 @@ pub const FunctionType = struct {
 };
 
 fn parseSectionType(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
     self.types = try self.gpa.alloc(FunctionType, count);
     errdefer self.gpa.free(self.types);
 
@@ -147,10 +161,10 @@ fn parseSectionType(self: *Module, r: *std.Io.Reader) !void {
         const form = try r.takeByte();
         if (form != 0x60) return error.InvalidTypeForm;
 
-        const param_count = try leb.readU32(r);
+        const param_count = try leb128.readInt(u32, r);
         const params: []ValueType = @ptrCast(try r.take(param_count));
 
-        const result_count = try leb.readU32(r);
+        const result_count = try leb128.readInt(u32, r);
         const results: []ValueType = @ptrCast(try r.take(result_count));
 
         t.* = .{
@@ -165,23 +179,24 @@ pub const Import = struct {
     field_name: []const u8,
     kind: ExternalKind,
     type_index: ?u32 = null, // only for function imports
+
 };
 
 fn parseSectionImport(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
     self.imports = try self.gpa.alloc(Import, count);
     errdefer self.gpa.free(self.imports);
 
     for (self.imports) |*import| {
-        const module_name_len = try leb.readU32(r);
+        const module_name_len = try leb128.readInt(u32, r);
         const module_name = try r.take(module_name_len);
 
-        const field_name_len = try leb.readU32(r);
+        const field_name_len = try leb128.readInt(u32, r);
         const field_name = try r.take(field_name_len);
 
         const kind = try r.takeEnum(ExternalKind, .little);
 
-        const type_index = if (kind == .function) try leb.readU32(r) else null;
+        const type_index = if (kind == .function) try leb128.readInt(u32, r) else null;
 
         import.* = .{
             .module_name = module_name,
@@ -193,11 +208,11 @@ fn parseSectionImport(self: *Module, r: *std.Io.Reader) !void {
 }
 
 fn parseSectionFunction(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
     self.functions = try self.gpa.alloc(u32, count);
     errdefer self.gpa.free(self.functions);
 
-    for (self.functions) |*f| f.* = try leb.readU32(r);
+    for (self.functions) |*f| f.* = try leb128.readInt(u32, r);
 }
 
 pub const Table = struct {
@@ -207,18 +222,18 @@ pub const Table = struct {
 };
 
 fn parseSectionTable(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
     self.tables = try self.gpa.alloc(Table, count);
     errdefer self.gpa.free(self.tables);
 
     for (self.tables) |*table| {
         const elem_type = try r.takeEnum(ValueType, .little);
 
-        const flags = try leb.readU32(r);
-        const min = try leb.readU32(r);
+        const flags = try leb128.readInt(u32, r);
+        const min = try leb128.readInt(u32, r);
 
         var max: ?u32 = null;
-        if (flags & 0x01 != 0) max = try leb.readU32(r);
+        if (flags & 0x01 != 0) max = try leb128.readInt(u32, r);
 
         table.* = .{
             .elem_type = elem_type,
@@ -234,16 +249,16 @@ pub const Memory = struct {
 };
 
 fn parseSectionMemory(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
     self.memories = try self.gpa.alloc(Memory, count);
     errdefer self.gpa.free(self.memories);
 
     for (self.memories) |*memory| {
-        const flags = try leb.readU32(r);
-        const min = try leb.readU32(r);
+        const flags = try leb128.readInt(u32, r);
+        const min = try leb128.readInt(u32, r);
 
         var max: ?u32 = null;
-        if (flags & 0x01 != 0) max = try leb.readU32(r);
+        if (flags & 0x01 != 0) max = try leb128.readInt(u32, r);
 
         memory.* = .{
             .min = min,
@@ -272,7 +287,7 @@ pub const Global = struct {
 };
 
 fn parseSectionGlobal(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
     self.globals = try self.gpa.alloc(Global, count);
     errdefer self.gpa.free(self.globals);
 
@@ -283,14 +298,14 @@ fn parseSectionGlobal(self: *Module, r: *std.Io.Reader) !void {
         const opcode = try r.takeByte();
         const init_expr: Global.InitExpr = switch (opcode) {
             0x41 => blk: { // i32.const
-                const value = try leb.readI32(r);
+                const value = try leb128.readInt(i32, r);
                 const end = try r.takeByte();
                 if (end != 0x0B) return error.InvalidInitExpr;
 
                 break :blk .{ .i32_const = value };
             },
             0x42 => blk: { // i64.const
-                const value = try leb.readI64(r);
+                const value = try leb128.readInt(i64, r);
                 const end = try r.takeByte();
                 if (end != 0x0B) return error.InvalidInitExpr;
 
@@ -311,7 +326,7 @@ fn parseSectionGlobal(self: *Module, r: *std.Io.Reader) !void {
                 break :blk .{ .f64_const = bits };
             },
             0x23 => blk: { // global.get
-                const index = try leb.readU32(r);
+                const index = try leb128.readInt(u32, r);
                 const end = try r.takeByte();
                 if (end != 0x0B) return error.InvalidInitExpr;
 
@@ -335,15 +350,15 @@ pub const Export = struct {
 };
 
 fn parseSectionExport(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
     try self.exports.ensureTotalCapacity(self.gpa, count);
     errdefer self.exports.deinit(self.gpa);
 
     for (0..count) |_| {
-        const name_len = try leb.readU32(r);
+        const name_len = try leb128.readInt(u32, r);
         const name = try r.take(@intCast(name_len));
         const kind = try r.takeEnum(ExternalKind, .little);
-        const index = try leb.readU32(r);
+        const index = try leb128.readInt(u32, r);
 
         const exp: Export = .{
             .name = name,
@@ -362,27 +377,27 @@ pub const Element = struct {
 };
 
 fn parseSectionElement(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
     self.elements = try self.gpa.alloc(Element, count);
     errdefer self.gpa.free(self.elements);
 
     for (self.elements) |*element| {
-        const table_index = try leb.readU32(r);
+        const table_index = try leb128.readInt(u32, r);
 
         // offset expression (i32.const X, end)
         const opcode = try r.takeByte();
         if (opcode != 0x41) return error.UnsupportedElementExpr;
 
-        const offset = try leb.readI32(r);
+        const offset = try leb128.readInt(i32, r);
 
         const end = try r.takeByte();
         if (end != 0x0B) return error.InvalidElementExpr;
 
-        const func_count = try leb.readU32(r);
+        const func_count = try leb128.readInt(u32, r);
         const funcs = try self.gpa.alloc(u32, func_count);
         errdefer self.gpa.free(funcs);
 
-        for (funcs) |*f| f.* = try leb.readU32(r);
+        for (funcs) |*f| f.* = try leb128.readInt(u32, r);
 
         element.* = .{
             .table_index = table_index,
@@ -394,7 +409,7 @@ fn parseSectionElement(self: *Module, r: *std.Io.Reader) !void {
 
 pub const FunctionBody = struct {
     locals: []ValueType,
-    code: []u8,
+    code: []Operation,
 };
 
 pub const Code = struct {
@@ -402,31 +417,38 @@ pub const Code = struct {
 };
 
 fn parseSectionCode(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
 
     self.code.functions = try self.gpa.alloc(FunctionBody, count);
     errdefer self.gpa.free(self.code.functions);
 
     for (self.code.functions) |*function| {
-        const body_size = try leb.readU32(r);
+        const body_size = try leb128.readInt(u32, r);
         const body_end = r.seek + body_size;
 
-        const local_count = try leb.readU32(r);
+        const local_count = try leb128.readInt(u32, r);
         var locals: std.ArrayList(ValueType) = try .initCapacity(self.gpa, local_count);
 
         for (0..local_count) |_| {
-            const value_type_count = try leb.readU32(r);
+            const value_type_count = try leb128.readInt(u32, r);
             const value_type = try r.takeEnum(ValueType, .little);
 
             try locals.appendNTimes(self.gpa, value_type, value_type_count);
         }
 
-        const code_start = r.seek;
-        // const code_len = body_end - code_start;
+        // const bytes = r.buffered();
+        var code: std.ArrayList(Operation) = .empty;
+
+        while (true) {
+            const opcode = try r.takeEnum(Opcode, .little);
+            const operation: Operation = .create(r, opcode);
+            try code.append(self.gpa, operation);
+            if (opcode == .end) break;
+        }
 
         function.* = .{
             .locals = try locals.toOwnedSlice(self.gpa),
-            .code = r.buffer[code_start..body_end],
+            .code = try code.toOwnedSlice(self.gpa),
         };
 
         r.seek = body_end;
@@ -440,23 +462,23 @@ pub const DataSegment = struct {
 };
 
 fn parseSectionData(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
 
     self.data = try self.gpa.alloc(DataSegment, count);
     errdefer self.gpa.free(self.data);
 
     for (self.data) |*segment| {
-        const memory_index = try leb.readU32(r);
+        const memory_index = try leb128.readInt(u32, r);
 
         const op = try r.takeByte();
         if (op != 0x41) return error.UnsupportedDataExpr;
 
-        const offset = try leb.readI32(r);
+        const offset = try leb128.readInt(i32, r);
 
         const end = try r.takeByte();
         if (end != 0x0B) return error.InvalidExpr;
 
-        const size = try leb.readU32(r);
+        const size = try leb128.readInt(u32, r);
         const bytes = try r.take(size);
 
         segment.* = .{
@@ -473,14 +495,14 @@ pub const Tag = struct {
 };
 
 fn parseSectionTag(self: *Module, r: *std.Io.Reader) !void {
-    const count = try leb.readU32(r);
+    const count = try leb128.readInt(u32, r);
 
     self.tags = try self.gpa.alloc(Tag, count);
     errdefer self.gpa.free(self.tags);
 
     for (self.tags) |*tag| {
-        const attribute = try leb.readU32(r);
-        const type_index = try leb.readU32(r);
+        const attribute = try leb128.readInt(u32, r);
+        const type_index = try leb128.readInt(u32, r);
 
         tag.* = .{
             .attribute = attribute,
