@@ -64,13 +64,15 @@ pub fn deinit(self: *Module) void {
     gpa.free(self.data);
     gpa.free(self.tags);
 }
+pub fn getImport(self: *const Module, kind: ExternalKind, index: usize) ?struct { Import, usize } {
+    var current: usize = 0;
+    for (self.imports, 0..) |import, i| {
+        if (import.kind != kind) continue;
+        if (current == index) return .{ import, i };
 
-pub fn getImport(self: *const Module, kind: ExternalKind, index: usize) Import {
-    var found: usize = 0;
-    for (self.imports) |import| {
-        if (import.kind == kind) found += 1 else continue;
-        if (index == found - 1) return import;
+        current += 1;
     }
+    return null;
 }
 
 pub fn parse(self: *Module, r: *std.Io.Reader) !void {

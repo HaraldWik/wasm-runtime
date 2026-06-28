@@ -89,10 +89,22 @@ pub fn main(init: std.process.Init) !void {
     var interpreter: wasm.Interpreter = try .init(gpa, &module);
     defer interpreter.deinit();
 
+    try interpreter.registerHostImport(.{ .field_name = "log_number", .value = .{ .function = log_number_wasm } });
+
     var params: [3]wasm.Interpreter.Value = undefined;
     params[0] = .{ .i32 = 1 };
     params[1] = .{ .i32 = 2 };
     params[2] = .{ .i32 = 3 };
     try interpreter.call("calling", &params);
     // try interpreter.call("math_i32", &params);
+
+}
+
+fn log_number_wasm(params: []wasm.Interpreter.Value) ?wasm.Interpreter.Value {
+    log_number(params[0].f64);
+    return null;
+}
+
+pub fn log_number(num: f64) void {
+    std.log.info("num: {d}", .{num});
 }
