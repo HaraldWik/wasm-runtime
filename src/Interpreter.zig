@@ -8,7 +8,7 @@ const Operation = @import("code.zig").Operation;
 
 gpa: std.mem.Allocator,
 module: *const Module,
-host_import: []HostImport,
+host_import: HostImport,
 
 memory: []u8 = &.{},
 globals: []Global = &.{},
@@ -26,25 +26,27 @@ pub const Value = union(enum) {
             inline else => |vt| @unionInit(Value, @tagName(vt), 0),
         };
     }
-
-    // pub fn ptr(self: Value) usize {
-    //     return switch (self) {
-    //         .i32 => @intCast(self.i32),
-    //         .i64 => @intCast(self.i64),
-    //         else => return,
-    //     };
-    // }
 };
 
 pub const HostImport = struct {
-    module_name: []const u8 = "env",
-    field_name: []const u8,
-    value: union(Module.ExternalKind) {
-        function: *const fn (params: []Value) ?Value,
-        table, // TODO
-        memory, // TODO
-        global, // TODO
-    },
+    functions: []Function = &.{},
+    // TODO: add more import types
+
+    pub const Function = struct {
+        module_name: []const u8 = "env",
+        field_name: []const u8,
+        ptr: *const fn (params: []Value) ?Value,
+    };
+
+    pub fn initCapacity(gpa: std.mem.Allocator, import: Module.Import) std.mem.Allocator.Error!HostImport {
+        return .{
+            .functions = try gpa.alloc(Function, import.functions.len),
+        };
+    }
+
+    pub fn deinit(self: HostImport, gpa: std.mem.Allocator) void {
+        gpa.free(self.functions);
+    }
 };
 
 pub const Global = struct {
@@ -70,58 +72,58 @@ pub const Global = struct {
     }
 };
 
-pub const Stack = struct {
-    gpa: std.mem.Allocator,
-    array_list: std.ArrayList(Value) = .empty,
+pub fn Stack(T: type) type {
+    return struct {
+        const Self = @This();
 
-    pub fn deinit(self: *Stack) void {
-        self.array_list.deinit(self.gpa);
-    }
+        gpa: std.mem.Allocator,
+        array_list: std.ArrayList(T) = .empty,
 
-    pub fn merge(self: *Stack, stack: *Stack) std.mem.Allocator.Error!void {
-        try self.array_list.appendSlice(self.gpa, stack.array_list.items);
-        stack.deinit();
-    }
+        pub fn deinit(self: *Self) void {
+            self.array_list.deinit(self.gpa);
+        }
 
-    pub fn push(self: *Stack, value: Value) std.mem.Allocator.Error!void {
-        try self.array_list.append(self.gpa, value);
-    }
+        pub fn merge(self: *Self, stack: *Self) std.mem.Allocator.Error!void {
+            try self.array_list.appendSlice(self.gpa, stack.array_list.items);
+            stack.deinit();
+        }
 
-    pub fn pop(self: *Stack) Value {
-        return self.array_list.pop().?;
-    }
+        pub fn push(self: *Self, item: T) std.mem.Allocator.Error!void {
+            try self.array_list.append(self.gpa, item);
+        }
 
-    pub fn popOrNull(self: *Stack) ?Value {
-        return self.array_list.pop();
-    }
+        pub fn pop(self: *Self) T {
+            return self.array_list.pop().?;
+        }
 
-    pub fn popN(self: *Stack, num: usize) []Value {
-        const len = self.array_list.items.len;
-        if (num > len) return &.{};
+        pub fn popN(self: *Self, num: usize) []T {
+            const len = self.array_list.items.len;
+            if (num > len) return &.{};
 
-        const start = len - num;
-        const slice = self.array_list.items[start..len];
+            const start = len - num;
+            const slice = self.array_list.items[start..len];
 
-        self.array_list.items.len = start;
+            self.array_list.items.len = start;
 
-        return slice;
-    }
+            return slice;
+        }
 
-    pub fn getLast(self: Stack) Value {
-        return self.array_list.getLast();
-    }
+        pub fn getLast(self: Self) T {
+            return self.array_list.getLast();
+        }
 
-    pub fn getLastOrNull(self: Stack) ?Value {
-        return self.array_list.getLastOrNull();
-    }
-};
+        pub fn getLastOrNull(self: Self) ?Value {
+            return self.array_list.getLastOrNull();
+        }
+    };
+}
 
 pub const Frame = struct {
     locals: []Value,
-    code: []Operation,
-    stack: Stack,
+    code: []const Operation,
+    stack: Stack(Value),
 
-    pub fn init(gpa: std.mem.Allocator, locals: []Value, code: []Operation) Frame {
+    pub fn init(gpa: std.mem.Allocator, locals: []Value, code: []const Operation) Frame {
         return .{
             .locals = locals,
             .code = code,
@@ -137,7 +139,7 @@ pub fn init(gpa: std.mem.Allocator, module: *const Module) !Interpreter {
     return .{
         .gpa = gpa,
         .module = module,
-        .host_import = try gpa.alloc(HostImport, module.imports.len),
+        .host_import = try .initCapacity(gpa, module.import),
         .memory = try gpa.alloc(u8, 1024),
         .globals = globals,
     };
@@ -145,31 +147,26 @@ pub fn init(gpa: std.mem.Allocator, module: *const Module) !Interpreter {
 
 pub fn deinit(self: *Interpreter) void {
     const gpa = self.gpa;
-    gpa.free(self.host_import);
+    self.host_import.deinit(gpa);
     gpa.free(self.memory);
     gpa.free(self.globals);
     self.frames.deinit(gpa);
 }
 
-pub const CallError = std.Io.Reader.TakeEnumError || std.mem.Allocator.Error;
+pub const CallError = std.Io.Reader.TakeEnumError || std.mem.Allocator.Error || error{ExportNotFound};
 
 pub fn call(self: *Interpreter, export_symbol: []const u8, params: []Value) CallError!void {
-    const exp = self.module.exports.get(export_symbol).?;
+    const exp = self.module.exports.get(export_symbol) orelse return error.ExportNotFound;
     std.debug.assert(exp.kind == .function);
 
     var stack = try self.callIndex(exp.index, params);
     defer stack.deinit();
 }
 
-fn callIndex(self: *Interpreter, index: usize, params: []Value) CallError!Stack {
+fn callIndex(self: *Interpreter, index: usize, params: []Value) CallError!Stack(Value) {
     const gpa = self.gpa;
 
-    const import_count = self.module.imports.len;
-
-    if (index < import_count) return self.callImport(index, params);
-
-    // const exports = self.module.exports.values();
-    // std.log.warn("call {s}", .{if (index < exports.len) exports[index].name else "unknown"});
+    const import_count = self.module.import.functions.len;
 
     const body = self.module.code.functions[index - import_count];
 
@@ -191,80 +188,143 @@ fn callIndex(self: *Interpreter, index: usize, params: []Value) CallError!Stack 
     return frame.stack;
 }
 
-pub fn registerHostImport(self: *Interpreter, host_import: HostImport) error{HostImportNotRequired}!void {
-    const index = for (self.module.imports, 0..) |import, i| {
-        if (std.mem.eql(u8, import.module_name, host_import.module_name) and std.mem.eql(u8, import.field_name, host_import.field_name)) break i;
+pub fn provideFunction(self: *Interpreter, function: HostImport.Function) error{HostImportNotRequired}!void {
+    const index = for (self.module.import.functions, 0..) |import, i| {
+        if (std.mem.eql(u8, import.module_name, function.module_name) and std.mem.eql(u8, import.field_name, function.field_name)) break i;
     } else return error.HostImportNotRequired;
-    self.host_import[index] = host_import;
+    self.host_import.functions[index] = function;
 }
 
-pub fn callImport(self: *Interpreter, index: usize, params: []Value) CallError!Stack {
-    const import, const import_index = self.module.getImport(.function, index) orelse std.debug.panic("function not found at index: {d}", .{index});
-    // std.log.warn("call import {s}.{s} ({t})", .{ import.module_name, import.field_name, import.kind });
-    const host_import = self.host_import[import_index];
+pub fn callImport(self: *Interpreter, index: usize, params: []Value) CallError!Stack(Value) {
+    const import = self.module.import.functions[index];
+    const host_import = self.host_import.functions[index];
     std.debug.assert(std.mem.eql(u8, host_import.module_name, import.module_name));
     std.debug.assert(std.mem.eql(u8, host_import.field_name, import.field_name));
 
-    if (host_import.value.function(params)) |value| {
-        var stack: Stack = .{ .gpa = self.gpa };
+    if (host_import.ptr(params)) |value| {
+        var stack: Stack(Value) = .{ .gpa = self.gpa };
         try stack.push(value);
         return stack;
     }
     return .{ .gpa = self.gpa };
 }
 
-pub fn execute(self: *Interpreter, frame: *Frame) CallError!void {
-    for (frame.code) |operation| {
-        try self.operate(operation, frame);
+pub const Block = struct {
+    kind: Kind = .block,
+    start: usize,
+    end: usize,
+    conditional: ?usize = null,
+    // if_value: ?bool = null, // use only if block.kind == .@"if"
 
-        // var buf: [128]u8 = undefined;
-        // var stdout: std.Io.File.Writer = .init(.stdout(), std.Options.debug_io, &buf);
-        // const log: *std.Io.Writer = &stdout.interface;
-        // _ = log.splatByte('\t', self.frames.items.len - 1) catch {};
-        // log.writeAll(@tagName(operation)) catch {};
-        // switch (operation) {
-        //     inline else => |op| if (@TypeOf(op) != void) {
-        //         log.writeAll("\x1b[94m") catch {};
-        //         log.print(" {any}", .{op}) catch {};
-        //         log.writeAll("\x1b[0m") catch {};
-        //     },
-        // }
-        // log.writeByte('\n') catch {};
-        // log.writeAll("\x1b[2m") catch {};
-        // for (frame.stack.array_list.items) |value| {
-        //     _ = log.splatByte('\t', self.frames.items.len) catch {};
-        //     log.writeAll(@tagName(value)) catch {};
-        //     switch (value) {
-        //         inline else => |val| log.print(": {d}\n", .{val}) catch {},
-        //     }
-        // }
-        // log.writeAll("\x1b[0m") catch {};
-        // log.flush() catch {};
+    pub const Kind = enum {
+        block,
+        loop,
+        @"if",
+    };
+
+    pub fn init(kind: Kind, current: usize, code: []const Operation) Block {
+        const start = current + 1;
+
+        var depth: isize = 0;
+        var conditional: ?usize = null;
+        var end: usize = 0;
+
+        for (code[start..], 0..) |op, i| {
+            switch (op) {
+                .block, .loop, .@"if" => depth += 1,
+                .end => {
+                    if (depth == 0) {
+                        end = i;
+                        break;
+                    }
+                    depth -= 1;
+                },
+                .@"else" => {
+                    if (kind == .@"if" and depth == 0) conditional = i;
+                },
+                else => {},
+            }
+        } else unreachable;
+
+        const base = start;
+
+        if (conditional) |c| conditional = base + c;
+
+        return .{
+            .kind = kind,
+            .start = start,
+            .end = start + end,
+            .conditional = conditional,
+        };
     }
-}
+};
 
-pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void {
-    switch (op) {
+pub fn execute(self: *Interpreter, frame: *Frame) CallError!void {
+    var blocks: Stack(Block) = .{ .gpa = self.gpa };
+    defer blocks.deinit();
+    try blocks.push(.{ .start = 0, .end = frame.code.len - 1 });
+
+    // Program counter
+    var pc: usize = 0;
+    while (pc < frame.code.len) : (pc += 1) switch (frame.code[pc]) {
         .@"unreachable" => unreachable,
         .nop => _ = frame.stack.pop(),
+        .block => try blocks.push(.init(.block, pc, frame.code)),
+        .loop => try blocks.push(.init(.loop, pc, frame.code)),
+        .@"if" => {
+            try blocks.push(.init(.@"if", pc, frame.code));
+            const block = blocks.getLast();
 
-        .block => {},
-        .loop => {},
-        .@"if" => {},
+            const condition = frame.stack.pop().i32 != 0;
+
+            if (!condition) {
+                pc = block.conditional orelse block.end;
+                continue;
+            }
+        },
         .@"else" => {},
+        .end => _ = blocks.pop(),
 
-        .end => {},
+        .br => |branch| {
+            const block = blocks.array_list.items[blocks.array_list.items.len - 1 - branch];
 
-        .br => {},
-        .br_if => {},
+            switch (block.kind) {
+                .loop => pc = block.start,
+                .block, .@"if" => pc = block.end,
+            }
+        },
+        .br_if => |branch| {
+            const cond = frame.stack.pop().i32 != 0;
+            if (cond) {
+                const block = blocks.array_list.items[blocks.array_list.items.len - 1 - branch];
+                switch (block.kind) {
+                    .loop => pc = block.start,
+                    .block, .@"if" => pc = block.end,
+                }
+            }
+        },
         .br_table => {},
 
-        .@"return" => {},
+        .@"return" => return,
         .call => |i| {
-            const function_type = self.module.types[i];
+            const function_type = blk: {
+                if (i < self.module.import.functions.len) {
+                    const imp = self.module.import.functions[i];
+                    break :blk &self.module.types[imp.type_index];
+                }
+
+                const fi = i - self.module.import.functions.len;
+                const type_index = self.module.functions[fi];
+                break :blk &self.module.types[type_index];
+            };
 
             const params = frame.stack.popN(function_type.params.len);
-            var return_stack = try self.callIndex(i, params);
+
+            var return_stack = if (i < self.module.import.functions.len)
+                try self.callImport(i, params)
+            else
+                try self.callIndex(i, params);
+
             try frame.stack.merge(&return_stack);
         },
 
@@ -365,6 +425,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .i32_le_u,
         .i32_ge_u,
         => {
+            const op = frame.code[pc];
             const rhs = frame.stack.pop().i32;
             const lhs = frame.stack.pop().i32;
             const result = switch (op) {
@@ -396,6 +457,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .i64_ge_s,
         .i64_ge_u,
         => {
+            const op = frame.code[pc];
             const rhs = frame.stack.pop().i64;
             const lhs = frame.stack.pop().i64;
             const result = switch (op) {
@@ -435,6 +497,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .i32_rotl,
         .i32_rotr,
         => {
+            const op = frame.code[pc];
             const rhs = frame.stack.pop().i32;
             const lhs = frame.stack.pop().i32;
             const result: i32 = switch (op) {
@@ -479,6 +542,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .i64_rotl,
         .i64_rotr,
         => {
+            const op = frame.code[pc];
             const rhs = frame.stack.pop().i64;
             const lhs = frame.stack.pop().i64;
             const result: i64 = switch (op) {
@@ -511,6 +575,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .f32_nearest,
         .f32_sqrt,
         => {
+            const op = frame.code[pc];
             const v = frame.stack.pop().f32;
             const result = switch (op) {
                 .f32_abs => @abs(v),
@@ -532,6 +597,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .f32_min,
         .f32_max,
         => {
+            const op = frame.code[pc];
             const rhs = frame.stack.pop().f32;
             const lhs = frame.stack.pop().f32;
             const result = switch (op) {
@@ -553,6 +619,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .f32_le,
         .f32_ge,
         => {
+            const op = frame.code[pc];
             const rhs = frame.stack.pop().f32;
             const lhs = frame.stack.pop().f32;
             const result = switch (op) {
@@ -576,6 +643,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .f64_nearest,
         .f64_sqrt,
         => {
+            const op = frame.code[pc];
             const v = frame.stack.pop().f64;
             const result = switch (op) {
                 .f64_abs => @abs(v),
@@ -597,6 +665,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .f64_min,
         .f64_max,
         => {
+            const op = frame.code[pc];
             const rhs = frame.stack.pop().f64;
             const lhs = frame.stack.pop().f64;
             const result = switch (op) {
@@ -618,6 +687,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .f64_le,
         .f64_ge,
         => {
+            const op = frame.code[pc];
             const rhs = frame.stack.pop().f64;
             const lhs = frame.stack.pop().f64;
             const result = switch (op) {
@@ -667,6 +737,7 @@ pub fn operate(self: *Interpreter, op: Operation, frame: *Frame) CallError!void 
         .i64_reinterpret_f64 => try frame.stack.push(.{ .i64 = @bitCast(frame.stack.pop().f64) }),
         .f64_reinterpret_i64 => try frame.stack.push(.{ .f64 = @bitCast(frame.stack.pop().i64) }),
 
-        else => {},
-    }
+        else => {}, // TODO
+
+    };
 }

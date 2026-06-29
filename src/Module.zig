@@ -9,7 +9,7 @@ const Operation = @import("code.zig").Operation;
 gpa: std.mem.Allocator,
 
 types: []FunctionType = &.{},
-imports: []Import = &.{},
+import: Import = .{},
 functions: []u32 = &.{},
 tables: []Table = &.{},
 memories: []Memory = &.{},
@@ -53,7 +53,7 @@ pub fn deinit(self: *Module) void {
     }
 
     gpa.free(self.types);
-    gpa.free(self.imports);
+    self.import.deinit(gpa);
     gpa.free(self.functions);
     gpa.free(self.tables);
     gpa.free(self.memories);
@@ -63,16 +63,6 @@ pub fn deinit(self: *Module) void {
     gpa.free(self.code.functions);
     gpa.free(self.data);
     gpa.free(self.tags);
-}
-pub fn getImport(self: *const Module, kind: ExternalKind, index: usize) ?struct { Import, usize } {
-    var current: usize = 0;
-    for (self.imports, 0..) |import, i| {
-        if (import.kind != kind) continue;
-        if (current == index) return .{ import, i };
-
-        current += 1;
-    }
-    return null;
 }
 
 pub fn parse(self: *Module, r: *std.Io.Reader) !void {
@@ -177,19 +167,39 @@ fn parseSectionType(self: *Module, r: *std.Io.Reader) !void {
 }
 
 pub const Import = struct {
-    module_name: []const u8,
-    field_name: []const u8,
-    kind: ExternalKind,
-    type_index: ?u32 = null, // only for function imports
+    functions: []Function = &.{},
+    tables: []General = &.{},
+    memories: []General = &.{},
+    globals: []General = &.{},
 
+    pub const Function = struct {
+        module_name: []const u8,
+        field_name: []const u8,
+        type_index: u32, // only for function imports
+    };
+
+    pub const General = struct {
+        module_name: []const u8,
+        field_name: []const u8,
+    };
+
+    pub fn deinit(self: *Import, gpa: std.mem.Allocator) void {
+        gpa.free(self.functions);
+        gpa.free(self.tables);
+        gpa.free(self.memories);
+        gpa.free(self.globals);
+    }
 };
 
 fn parseSectionImport(self: *Module, r: *std.Io.Reader) !void {
+    const gpa = self.gpa;
     const count = try leb128.readInt(u32, r);
-    self.imports = try self.gpa.alloc(Import, count);
-    errdefer self.gpa.free(self.imports);
+    var functions: std.ArrayList(Import.Function) = try .initCapacity(gpa, count);
+    var tables: std.ArrayList(Import.General) = try .initCapacity(gpa, count);
+    var memories: std.ArrayList(Import.General) = try .initCapacity(gpa, count);
+    var globals: std.ArrayList(Import.General) = try .initCapacity(gpa, count);
 
-    for (self.imports) |*import| {
+    for (0..count) |_| {
         const module_name_len = try leb128.readInt(u32, r);
         const module_name = try r.take(module_name_len);
 
@@ -200,13 +210,22 @@ fn parseSectionImport(self: *Module, r: *std.Io.Reader) !void {
 
         const type_index = if (kind == .function) try leb128.readInt(u32, r) else null;
 
-        import.* = .{
-            .module_name = module_name,
-            .field_name = field_name,
-            .kind = kind,
-            .type_index = type_index,
-        };
+        const general: Import.General = .{ .module_name = module_name, .field_name = field_name };
+
+        switch (kind) {
+            .function => functions.appendAssumeCapacity(.{ .module_name = module_name, .field_name = field_name, .type_index = type_index.? }),
+            .table => tables.appendAssumeCapacity(general),
+            .memory => memories.appendAssumeCapacity(general),
+            .global => globals.appendAssumeCapacity(general),
+        }
     }
+
+    self.import = .{
+        .functions = try functions.toOwnedSlice(gpa),
+        .tables = try tables.toOwnedSlice(gpa),
+        .memories = try memories.toOwnedSlice(gpa),
+        .globals = try globals.toOwnedSlice(gpa),
+    };
 }
 
 fn parseSectionFunction(self: *Module, r: *std.Io.Reader) !void {

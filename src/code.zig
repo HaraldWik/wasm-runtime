@@ -1,5 +1,6 @@
 const std = @import("std");
 const leb128 = @import("leb128.zig");
+const ValueType = @import("Module.zig").ValueType;
 
 pub const Opcode = enum(u8) {
     // Control flow
@@ -220,16 +221,13 @@ pub const Operation = union(Opcode) {
     // Control flow
     @"unreachable",
     nop,
-    block: u32,
-    loop: u32,
-    @"if": u32,
+    block: BlockType,
+    loop: BlockType,
+    @"if": BlockType,
     @"else",
     end,
-    /// branch
     br: u32,
-    /// branch if
     br_if: u32,
-    /// branch table
     br_table: BranchTable,
     @"return",
 
@@ -436,6 +434,12 @@ pub const Operation = union(Opcode) {
     f32_reinterpret_i32,
     f64_reinterpret_i64,
 
+    pub const BlockType = union(enum) {
+        empty, // 0x40
+        valtype: ValueType,
+        type_index: u32,
+    };
+
     pub const BranchTable = struct {
         targets: []u8, // vector of label indices
         default: u32,
@@ -465,11 +469,27 @@ pub const Operation = union(Opcode) {
                     .default = default,
                 } };
             },
-            .f32_const => return .{ .f32_const = @bitCast(r.takeInt(u32, .little) catch unreachable) },
-            .f64_const => return .{ .f64_const = @bitCast(r.takeInt(u64, .little) catch unreachable) },
+            // .f32_const => return .{ .f32_const = @bitCast(r.takeInt(u32, .little) catch unreachable) },
+            // .f64_const => return .{ .f64_const = @bitCast(r.takeInt(u64, .little) catch unreachable) },
             inline else => |comptime_opcode| {
                 const T = @FieldType(Operation, @tagName(comptime_opcode));
-                const t = leb128.readValue(T, r) catch unreachable;
+                const t = if (T == BlockType) @as(BlockType, block_type: {
+                    const byte = r.peekByte() catch unreachable;
+
+                    if (byte == 0x40) {
+                        r.toss(1);
+                        break :block_type .empty;
+                    } else if (std.enums.fromInt(ValueType, byte)) |vt| {
+                        r.toss(1);
+                        break :block_type .{ .valtype = vt };
+                    } else {
+                        const type_index = leb128.readU32(r) catch unreachable;
+                        break :block_type .{ .type_index = type_index };
+                    }
+                }) else switch (@typeInfo(T)) {
+                    .float => |float| @as(T, @bitCast(r.takeInt(@Int(.unsigned, float.bits), .little) catch unreachable)),
+                    else => leb128.readValue(T, r) catch unreachable,
+                };
                 return @unionInit(Operation, @tagName(comptime_opcode), t);
             },
         }

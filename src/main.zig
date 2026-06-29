@@ -33,8 +33,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("imports:\n", .{});
-    for (module.imports, 0..) |import, i| {
-        std.debug.print("\t{d}: {s}.{s} {t} {?}\n", .{ i, import.module_name, import.field_name, import.kind, import.type_index });
+    for (module.import.functions, 0..) |function, i| {
+        std.debug.print("\t(import \"{s}\" \"{s}\" (func (;{d};) (type {d})))\n", .{ function.module_name, function.field_name, i, function.type_index });
     }
 
     std.debug.print("functions:\n", .{});
@@ -89,15 +89,11 @@ pub fn main(init: std.process.Init) !void {
     var interpreter: wasm.Interpreter = try .init(gpa, &module);
     defer interpreter.deinit();
 
-    try interpreter.registerHostImport(.{ .field_name = "log_number", .value = .{ .function = log_number_wasm } });
+    // try interpreter.provideFunction(.{ .field_name = "log_number", .ptr = log_number_wasm });
 
-    var params: [3]wasm.Interpreter.Value = undefined;
-    params[0] = .{ .i32 = 1 };
-    params[1] = .{ .i32 = 2 };
-    params[2] = .{ .i32 = 3 };
-    try interpreter.call("calling", &params);
-    // try interpreter.call("math_i32", &params);
-
+    var params: [1]wasm.Interpreter.Value = undefined;
+    params[0] = .{ .f64 = 6 };
+    try interpreter.call("fac", &params);
 }
 
 fn log_number_wasm(params: []wasm.Interpreter.Value) ?wasm.Interpreter.Value {

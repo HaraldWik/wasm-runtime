@@ -38,3 +38,28 @@ export fn calling(param: i32) void {
 
     log_number(d);
 }
+
+export fn loop(param: usize) void {
+    for (0..param) |i| {
+        log_number(@floatFromInt(i));
+    }
+}
+
+export fn loop_if(param: usize) void {
+    if (param >= 67) for (0..param) |i| {
+        log_number(@floatFromInt(i));
+    };
+}
+
+export fn print_fib(param: u32) void {
+    @setRuntimeSafety(true);
+    switch (param) {
+        0 => log_number(1),
+        1 => log_number(2),
+        2 => log_number(3),
+        3 => log_number(5),
+        4 => log_number(8),
+        else => unreachable,
+    }
+    @setRuntimeSafety(false);
+}
